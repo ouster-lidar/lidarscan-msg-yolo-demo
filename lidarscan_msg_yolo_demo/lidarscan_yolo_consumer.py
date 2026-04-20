@@ -7,7 +7,7 @@ channels to BGR, run Ultralytics YOLO, publish annotated images.
 from __future__ import annotations
 
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import rclpy
@@ -33,9 +33,20 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2, PointField
 from std_msgs.msg import Header
 from lidar_msgs.msg import LidarChannel, LidarInfo, LidarScan
+
+# C++ implementation of the scan -> xyz float32 projection, exposed via pybind11
+# from the lidar-conversions package. Imported lazily so the node still loads
+# if the binding is missing — the point cloud topic will just stay silent.
+try:
+    import lidar_conversions_py as _lidar_conversions_py
+except Exception as _lc_exc:  # noqa: BLE001
+    _lidar_conversions_py = None
+    _lc_import_error = _lc_exc
+else:
+    _lc_import_error = None
 
 # sensor_msgs/msg/PointField.idl numeric types
 _POINT_INT8 = 1
@@ -119,6 +130,31 @@ def _to_bgr_visual(
     return color
 
 
+def _build_pointcloud2(
+    header: Header,
+    data: bytes,
+    height: int,
+    width: int,
+    is_dense: bool,
+) -> PointCloud2:
+    """Wrap the xyz float32 buffer returned by the C++ binding as PointCloud2."""
+    msg = PointCloud2()
+    msg.header = header
+    msg.height = height
+    msg.width = width
+    msg.fields = [
+        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+    msg.is_bigendian = False
+    msg.point_step = 12
+    msg.row_step = msg.point_step * width
+    msg.data = data
+    msg.is_dense = bool(is_dense)
+    return msg
+
+
 def _bgr_to_ros_image(header: Header, bgr: np.ndarray) -> Image:
     msg = Image()
     msg.header = header
@@ -147,6 +183,9 @@ class YoloLidarConsumer(Node):
         self.declare_parameter('imgsz', 640)
         self.declare_parameter('lidar_info_topic', '/ouster/lidar_info')
         self.declare_parameter('lidar_scan_topic', '/ouster/lidar_scan')
+        self.declare_parameter('points_topic', '/ouster_yolo/points')
+        self.declare_parameter('points_organized', True)
+        self.declare_parameter('range_channel_name', 'range')
 
         model_name = self.get_parameter('model_name').get_parameter_value().string_value
         self._conf = float(
@@ -194,9 +233,34 @@ class YoloLidarConsumer(Node):
                 ),
             )
 
+        points_topic = self.get_parameter('points_topic').value
+        self._points_organized = bool(
+            self.get_parameter('points_organized').value
+        )
+        self._range_channel_name = str(
+            self.get_parameter('range_channel_name').value
+        )
+        self._points_pub = self.create_publisher(
+            PointCloud2,
+            points_topic,
+            QoSProfile(
+                depth=5,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+            ),
+        )
+
+        if _lidar_conversions_py is None:
+            self.get_logger().warning(
+                'lidar_conversions_py binding not importable; '
+                f'{points_topic} will not be published. Error: {_lc_import_error!r}'
+            )
+
         self.get_logger().info(
             'YOLO lidar consumer ready (RANGE, NEAR_IR, REFLECTIVITY). '
-            f'Publishing annotated images under /ouster_yolo/*_annotated'
+            f'Publishing annotated images under /ouster_yolo/*_annotated and '
+            f'projected points on {points_topic}.'
         )
 
     def _on_info(self, msg: LidarInfo) -> None:
@@ -220,10 +284,43 @@ class YoloLidarConsumer(Node):
             by_name[ch.name.lower()] = ch
         return by_name
 
+    def _publish_pointcloud(self, scan: LidarScan) -> None:
+        """Project scan -> PointCloud2 via the C++ binding and publish."""
+        if _lidar_conversions_py is None:
+            return
+
+        info = self._latest_info
+        if info is None:
+            self.get_logger().warn(
+                'Waiting for LidarInfo before publishing point cloud...',
+                throttle_duration_sec=1.0
+            )
+            return
+
+        try:
+            # TODO[unaal]: Modifu _lidar_conversions_py to produce a PointCloud2 message directly.
+            data, h, w, is_dense = (
+                _lidar_conversions_py.lidar_scan_to_pointcloud2_data(
+                    info, scan,
+                    self._range_channel_name,
+                    self._points_organized,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f'LidarScanToPointCloud failed: {exc}',
+                throttle_duration_sec=1.0
+            )
+
+        self._points_pub.publish(
+            _build_pointcloud2(scan.header, data, h, w, is_dense)
+        )
+
     def _on_scan(self, scan: LidarScan) -> None:
         if scan.height == 0 or scan.width == 0 or not scan.data:
             return
         self._maybe_log_info_sync(scan)
+        self._publish_pointcloud(scan)
         by_name = self._find_channels(scan)
         header = scan.header
 
