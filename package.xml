@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>lidarscan_msg_yolo_demo</name>
+  <version>0.1.0</version>
+  <description>
+    Python node that subscribes to lidar_msgs/LidarInfo and LidarScan,
+    decodes RANGE, NEAR_IR, and REFLECTIVITY channels into BGR images, runs
+    Ultralytics YOLO, and publishes annotated sensor_msgs/Image topics for RViz2.
+  </description>
+  <maintainer email="oss@ouster.io">ouster developers</maintainer>
+  <license>BSD-3-Clause</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+
+  <!-- Metapackage / driver stack; documents expectation that os_driver publishes lidar topics -->
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>lidar_msgs</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
